@@ -1,0 +1,331 @@
+/**
+ * \file
+ *
+ * \brief SAM TC - Timer Counter Callback Driver
+ *
+ * Copyright (C) 2013-2016 Atmel Corporation. All rights reserved.
+ *
+ * \asf_license_start
+ *
+ * \page License
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. The name of Atmel may not be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * 4. This software may only be redistributed and used in connection with an
+ *    Atmel microcontroller product.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ATMEL "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT ARE
+ * EXPRESSLY AND SPECIFICALLY DISCLAIMED. IN NO EVENT SHALL ATMEL BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * \asf_license_stop
+ *
+ */
+
+/*
+ * Support and FAQ: visit <a href="http://www.atmel.com/design-support/">Atmel Support</a>
+ */
+
+#include "tc_interrupt.h"
+
+void *_tc_instances[TC_INST_NUM];
+
+void _tc_interrupt_handler(uint8_t instance);
+
+#define CLEAR_ORB					0xC8000000UL //31,30,27
+
+
+#define STATUS_REGISTER_ADD			0x4200180FUL
+#define COMPARE_REGISTER_ADD        0x42001818UL
+#define MASK_SYNC					0x80UL
+
+#define COUNT_REGISTER_ADD			0x42001810UL
+
+#define PORT_CLEAR_REGISTER_ADD     0x41004414UL
+#define PORT_SET_REGISTER_ADD		0x41004418UL
+
+#define TOTAL_LEDS                    3
+
+#define NO_OF_LEDS                    3
+#define MAX_SERIAL_TIMEOUT            2
+
+volatile uint8_t N_valid_compares = NO_OF_LEDS;
+extern volatile bool update_compare_array;
+extern volatile uint8_t temp_compare_array[NO_OF_LEDS];
+extern volatile uint8_t temp_pin_array[NO_OF_LEDS];
+extern volatile bool lock_temp_array;
+
+extern volatile uint8_t serial_timeout_count;
+extern volatile bool serial_timeout;
+
+/**
+ * \brief Registers a callback.
+ *
+ * Registers a callback function which is implemented by the user.
+ *
+ * \note The callback must be enabled by \ref tc_enable_callback,
+ * in order for the interrupt handler to call it when the conditions for the
+ * callback type is met.
+ *
+ * \param[in]     module        Pointer to TC software instance struct
+ * \param[in]     callback_func Pointer to callback function
+ * \param[in]     callback_type Callback type given by an enum
+ */
+enum status_code tc_register_callback(
+		struct tc_module *const module,
+		tc_callback_t callback_func,
+		const enum tc_callback callback_type)
+{
+	/* Sanity check arguments */
+	Assert(module);
+	Assert(callback_func);
+
+	/* Register callback function */
+	module->callback[callback_type] = callback_func;
+
+	/* Set the bit corresponding to the callback_type */
+	if (callback_type == TC_CALLBACK_CC_CHANNEL0) {
+		module->register_callback_mask |= TC_INTFLAG_MC(1);
+	}
+	else if (callback_type == TC_CALLBACK_CC_CHANNEL1) {
+		module->register_callback_mask |= TC_INTFLAG_MC(2);
+	}
+	else {
+		module->register_callback_mask |= (1 << callback_type);
+	}
+	return STATUS_OK;
+}
+
+/**
+ * \brief Unregisters a callback.
+ *
+ * Unregisters a callback function implemented by the user. The callback should be
+ * disabled before it is unregistered.
+ *
+ * \param[in]     module        Pointer to TC software instance struct
+ * \param[in]     callback_type Callback type given by an enum
+ */
+enum status_code tc_unregister_callback(
+		struct tc_module *const module,
+		const enum tc_callback callback_type)
+{
+	/* Sanity check arguments */
+	Assert(module);
+
+	/* Unregister callback function */
+	module->callback[callback_type] = NULL;
+
+	/* Clear the bit corresponding to the callback_type */
+	if (callback_type == TC_CALLBACK_CC_CHANNEL0) {
+		module->register_callback_mask &= ~TC_INTFLAG_MC(1);
+	}
+	else if (callback_type == TC_CALLBACK_CC_CHANNEL1) {
+		module->register_callback_mask &= ~TC_INTFLAG_MC(2);
+	}
+	else {
+		module->register_callback_mask &= ~(1 << callback_type);
+	}
+	return STATUS_OK;
+}
+
+/**
+ * \internal ISR handler for TC
+ *
+ * Auto-generate a set of interrupt handlers for each TC in the device.
+ */
+#define _TC_INTERRUPT_HANDLER(n, m) \
+		void TC##n##_Handler(void) \
+		{ \
+			_tc_interrupt_handler(m); \
+		}
+
+#if (SAML21E) || (SAML21G) || (SAMR30E) || (SAMR30G)
+	_TC_INTERRUPT_HANDLER(0,0)
+	_TC_INTERRUPT_HANDLER(1,1)
+	_TC_INTERRUPT_HANDLER(4,2)
+#else
+	MRECURSION(TC_INST_NUM, _TC_INTERRUPT_HANDLER, TC_INST_MAX_ID)
+#endif
+
+
+/**
+ * \internal Interrupt Handler for TC module
+ *
+ * Handles interrupts as they occur, it will run the callback functions
+ * that are registered and enabled.
+ *
+ * \param[in]  instance  ID of the TC instance calling the interrupt
+ *                       handler
+ */
+void _tc_interrupt_handler(
+		uint8_t instance)
+{
+	volatile uint8_t*  const  COUNT_REGISTER      = COUNT_REGISTER_ADD;
+	volatile uint32_t* const PORT_CLEAR_REGISTER  = PORT_CLEAR_REGISTER_ADD;
+	volatile uint8_t* const STATUS_REGISTER       = STATUS_REGISTER_ADD;
+	volatile uint8_t* const COMPARE_REGISTER	  = COMPARE_REGISTER_ADD;
+	volatile uint32_t* const  PORT_SET		      = PORT_SET_REGISTER_ADD;
+	/* Temporary variable */
+	uint8_t interrupt_and_callback_status_mask;
+	uint8_t i =0;
+	static bool int_enable = false;
+	static bool led_disable_flag = false;
+	uint32_t B2_RGB = 0x08000000;
+	uint32_t G2_RGB = 0x00000200;
+	static uint8_t compare_value=0;
+	static uint8_t compare_value_last=0;
+	static uint8_t compare_value_current=0;
+	static bool first_time		  = true;
+	static volatile uint8_t compare_array[NO_OF_LEDS];
+	static volatile uint8_t compare_array_ID;
+	static volatile uint8_t pin_array[NO_OF_LEDS];
+	static volatile uint8_t pin_array_ID;
+
+
+
+	/* Get device instance from the look-up table */
+	struct tc_module *module = (struct tc_module *)_tc_instances[instance];
+
+	/* Read and mask interrupt flag register */
+	interrupt_and_callback_status_mask = module->hw->COUNT8.INTFLAG.reg & module->register_callback_mask & module->enable_callback_mask;
+			
+	/* Check if an Match/Capture Channel 0 interrupt has occurred */
+	if (interrupt_and_callback_status_mask & TC_INTFLAG_MC(1)) {
+		if(first_time == false)
+		{
+			if(compare_array_ID != N_valid_compares)
+			{
+				*PORT_SET		 = (1UL << pin_array[pin_array_ID++] ) ;
+				compare_array_ID = compare_array_ID + 1;
+			}
+			
+			if(compare_array_ID < N_valid_compares )
+			{
+				compare_value_last    = compare_array[compare_array_ID - 1];
+				compare_value_current = compare_array[compare_array_ID];
+				while((compare_value_last == compare_value_current) && (compare_array_ID <= N_valid_compares - 1))
+				{
+					//Enable the LED
+					*PORT_SET		 = (1UL << pin_array[pin_array_ID++] ) ;
+					compare_value_last	  = compare_array[compare_array_ID];
+					compare_value_current = compare_array[++compare_array_ID];
+				}
+				if(compare_value_current != 255)
+				{
+					//check sync
+					while((*STATUS_REGISTER && MASK_SYNC) == true);
+					*COMPARE_REGISTER         =	compare_value_current;
+					*COUNT_REGISTER           =	compare_value_last;			
+				}
+				else
+				{
+					while((*STATUS_REGISTER && MASK_SYNC) == true);
+					*COUNT_REGISTER         =	compare_value_last;
+				}
+			}
+			
+			
+		}
+		else
+		{
+			first_time = false;
+			
+		}
+		module->hw->COUNT8.INTFLAG.reg = TC_INTFLAG_MC(1);
+	}
+	
+	/* Check if an Overflow interrupt has occurred */
+	if (interrupt_and_callback_status_mask & TC_INTFLAG_OVF) {
+	
+		serial_timeout_count++;
+		if(serial_timeout_count > MAX_SERIAL_TIMEOUT)
+		{
+			serial_timeout = true;
+			serial_timeout_count = 0;
+		}
+		*PORT_CLEAR_REGISTER						  = CLEAR_ORB;
+		if(update_compare_array == true)
+		{
+			//B2 on 
+			//*PORT_SET = B2_RGB;
+			if(int_enable == true)
+			{
+				int_enable = false;
+				if(led_disable_flag == true)
+				{
+					tc_enable_callback(module, TC_CALLBACK_CC_CHANNEL0);
+					tc_clear_status(module,0x00000011);
+					led_disable_flag = false;
+				}
+				tc_enable_callback(module, TC_CALLBACK_CC_CHANNEL0);
+			}
+			
+			//transfer_temp();
+			//if(lock_temp_array == false)
+			//{
+				N_valid_compares = 0;
+			
+				for(i=0;i<NO_OF_LEDS;i++)
+				{
+					//N_valid_compares++;
+				
+					if(temp_compare_array[i] != 255)
+					{
+						N_valid_compares++;
+						//k++;
+					}
+				
+					compare_array[i] = temp_compare_array[i] ;
+					pin_array[i]	 = temp_pin_array[i];
+				}
+				
+			//}
+			update_compare_array = false;
+			//*PORT_CLEAR_REGISTER = B2_RGB;
+		}
+		compare_array_ID = 0;
+		pin_array_ID  = 0;
+		
+		compare_value = compare_array[0];
+		if(compare_value != 255)
+		{
+			
+			led_disable_flag = true;
+			//Check sync busy
+			while((*STATUS_REGISTER && MASK_SYNC) == true);
+			//Update the compare value
+			*COMPARE_REGISTER  = compare_value;
+			//tc_set_compare_value(module_inst, TC_COMPARE_CAPTURE_CHANNEL_0, compare_value);
+		}
+		else
+		{
+			int_enable = true;
+			tc_disable_callback(module, TC_CALLBACK_CC_CHANNEL0);
+		}
+		while((*STATUS_REGISTER && MASK_SYNC) == true);
+		*COUNT_REGISTER           =	0;
+		module->hw->COUNT8.INTFLAG.reg = TC_INTFLAG_OVF;
+
+	}
+	
+	
+}
