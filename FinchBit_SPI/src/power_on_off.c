@@ -60,7 +60,7 @@ void check_power_off_button()
 		count_power_button++;
 		if(count_power_button > POWER_OFF_LIMIT)
 		{
-			//system_power_off();
+			system_power_off();
 		}
 	}
 }

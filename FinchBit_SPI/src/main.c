@@ -32,8 +32,8 @@ int main (void)
 	/* Insert application code here, after the board has been initialized. */
 	while(1)
 	{
-		//check_power_off_button();
+		check_power_off_button();
 		//test_RGB();
-	    test_motors();
+	    //test_motors();
 	}
 }
